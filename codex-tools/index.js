@@ -2,6 +2,8 @@ export const pocketApi = 1;
 
 const MAX_RECORDING_MS = 3 * 60 * 1000;
 const MAX_RECORDING_BYTES = (MAX_RECORDING_MS / 1000) * 24000 * 2;
+// One bar per 100 ms: half-speed scrolling and twice the visible audio history.
+const WAVEFORM_HISTORY_STEP_MS = 100;
 
 // PCM16, mono, 24 kHz: the wire format used by Codex dictation.
 export function pcm24k(samples, rate) {
@@ -39,8 +41,47 @@ function base64(bytes) {
 
 export default function setup(pocket) {
     let current = null;
+    let cancellation = 0;
     let disposed = false;
     const hidden = new Map();
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const providerKey = "x.codex-tools.provider";
+    let provider = "codex";
+
+    try {
+        if (localStorage.getItem(providerKey) === "browser" && SpeechRecognition) {
+            provider = "browser";
+        }
+    } catch {}
+
+    const providerSelect = document.createElement("select");
+    providerSelect.dataset.codexProvider = "true";
+    providerSelect.setAttribute("aria-label", "Dictation provider");
+    providerSelect.title =
+        "Codex sends audio to OpenAI. Browser / Apple uses your browser vendor's speech service; on-device processing is not guaranteed. Browser mode has no audio levels.";
+    providerSelect.style.cssText =
+        "min-height:44px;max-width:10em;min-width:0;font:inherit;font-size:12px;color:var(--text);background:var(--card,var(--bg));border:1px solid var(--line);border-radius:8px";
+    for (const [value, label] of [
+        ["codex", "Codex"],
+        ["browser", SpeechRecognition ? "Browser / Apple" : "Browser / Apple (unavailable)"],
+    ]) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = label;
+        option.disabled = value === "browser" && !SpeechRecognition;
+        providerSelect.append(option);
+    }
+    providerSelect.value = provider;
+    providerSelect.addEventListener("change", () => {
+        cancel();
+        provider = providerSelect.value === "browser" && SpeechRecognition ? "browser" : "codex";
+        providerSelect.value = provider;
+        try {
+            localStorage.setItem(providerKey, provider);
+        } catch {}
+        status("idle");
+        showProviderNotice();
+    });
     const mic = document.createElement("button");
     const limitNotice = document.createElement("span");
     const waveform = document.createElement("button");
@@ -94,7 +135,9 @@ export default function setup(pocket) {
                   ? "Stop dictation (connecting)"
                   : state === "transcribing"
                     ? "Transcribing dictation"
-                    : "Codex dictation";
+                    : provider === "browser"
+                      ? "Browser / Apple dictation"
+                      : "Codex dictation";
 
         const loading = state === "connecting" || state === "transcribing";
 
@@ -128,7 +171,7 @@ export default function setup(pocket) {
     }
 
     function drawWaveform(recording) {
-        const samples = new Uint8Array(recording.analyser.fftSize);
+        const samples = new Uint8Array(recording.analyser?.fftSize || 0);
         const context = waveformCanvas.getContext("2d");
         const levels = [];
         let lastSampleAt = -Infinity;
@@ -155,15 +198,17 @@ export default function setup(pocket) {
 
                 const now = performance.now();
 
-                if (now - lastSampleAt >= 50) {
-                    recording.analyser.getByteTimeDomainData(samples);
+                if (now - lastSampleAt >= WAVEFORM_HISTORY_STEP_MS) {
+                    recording.analyser?.getByteTimeDomainData(samples);
                     let energy = 0;
 
                     for (const sample of samples) {
                         energy += ((sample - 128) / 128) ** 2;
                     }
 
-                    const level = Math.min(1, Math.sqrt(energy / samples.length) * 6);
+                    const level = samples.length
+                        ? Math.min(1, Math.sqrt(energy / samples.length) * 6)
+                        : 0;
 
                     previousLevel = Math.max(level, previousLevel * 0.8);
                     levels.push(previousLevel);
@@ -213,15 +258,39 @@ export default function setup(pocket) {
         clearTimeout(recording.timer);
         clearInterval(recording.flushTimer);
         cancelAnimationFrame(recording.waveFrame);
-        recording.analyser?.disconnect();
-        recording.processor?.disconnect();
-        recording.source?.disconnect();
-        recording.gain?.disconnect();
-        recording.stream?.getTracks().forEach((track) => track.stop());
-        void recording.context?.close().catch(() => {});
+        // Stop tracks first: a disconnected/closed node must not strand the microphone.
+        for (const track of recording.stream?.getTracks() || []) {
+            try {
+                track.stop();
+            } catch {}
+        }
+        for (const node of [
+            recording.analyser,
+            recording.processor,
+            recording.source,
+            recording.gain,
+        ]) {
+            try {
+                node?.disconnect();
+            } catch {}
+        }
+        try {
+            void recording.context?.close().catch(() => {});
+        } catch {}
+        if (recording.recognition) {
+            recording.recognition.onstart = null;
+            recording.recognition.onresult = null;
+            recording.recognition.onerror = null;
+            recording.recognition.onend = null;
+            try {
+                recording.recognition.abort();
+            } catch {}
+            recording.resolveBrowser();
+        }
     }
 
     function cancel() {
+        cancellation++;
         const recording = current;
 
         current = null;
@@ -404,29 +473,50 @@ export default function setup(pocket) {
         }
 
         recording.finishing = true;
-        release(recording);
+        if (recording.provider !== "browser") {
+            release(recording);
+        }
         status("transcribing");
         let succeeded = false;
 
         try {
-            await recording.connection;
-            flush(recording);
-            await recording.upload;
-            flush(recording);
-            await recording.upload;
-            recording.abort.signal.throwIfAborted();
-            const result = await pocket.api(
-                `finish/${recording.id}`,
-                {},
-                { signal: recording.abort.signal },
-            );
+            if (recording.provider === "browser") {
+                // stop() delivers the last phrase before onend; abort() would discard it.
+                recording.stopTimer = setTimeout(() => {
+                    recording.browserError = new Error("Browser speech did not finish. Try again.");
+                    recording.resolveBrowser();
+                }, 5000);
+                try {
+                    if (!recording.browserEnded) recording.recognition.stop();
+                    await recording.browserDone;
+                } finally {
+                    clearTimeout(recording.stopTimer);
+                    release(recording);
+                }
+                recording.abort.signal.throwIfAborted();
+                if (recording.browserError) throw recording.browserError;
+                if (!recording.raw.trim()) throw new Error("No speech recognized. Try again.");
+                succeeded = sameBox(recording);
+            } else {
+                await recording.connection;
+                flush(recording);
+                await recording.upload;
+                flush(recording);
+                await recording.upload;
+                recording.abort.signal.throwIfAborted();
+                const result = await pocket.api(
+                    `finish/${recording.id}`,
+                    {},
+                    { signal: recording.abort.signal },
+                );
 
-            if (!result.text?.trim() && !recording.raw) {
-                throw new Error("No speech recognized. Try again.");
+                if (!result.text?.trim() && !recording.raw) {
+                    throw new Error("No speech recognized. Try again.");
+                }
+
+                renderTranscript(recording, result.text);
+                succeeded = sameBox(recording);
             }
-
-            renderTranscript(recording, result.text);
-            succeeded = sameBox(recording);
         } catch (failure) {
             if (!disposed && !recording.abort.signal.aborted) {
                 pocket.notify("error", failure.message);
@@ -438,6 +528,7 @@ export default function setup(pocket) {
         }
 
         if (succeeded && recording.sendRequested) {
+            const completedAt = cancellation;
             // Use Pocket's normal send path after it reconciles the final draft.
             await new Promise((resolve) =>
                 requestAnimationFrame(() => requestAnimationFrame(resolve)),
@@ -445,6 +536,7 @@ export default function setup(pocket) {
 
             if (
                 !disposed &&
+                completedAt === cancellation &&
                 !current &&
                 pocket.conversationId() === recording.conversationId &&
                 recording.box.isConnected
@@ -467,6 +559,64 @@ export default function setup(pocket) {
         void finish();
     }
 
+    function showProviderNotice() {
+        limitNotice.textContent =
+            provider === "browser"
+                ? "Browser/vendor processing · no audio levels (not guaranteed on-device)"
+                : "";
+        limitNotice.hidden = provider !== "browser";
+    }
+
+    function startBrowser(recording) {
+        const completion = Promise.withResolvers();
+        recording.browserDone = completion.promise;
+        recording.resolveBrowser = completion.resolve;
+        recording.phrases = [];
+
+        try {
+            const recognition = new SpeechRecognition();
+            recording.recognition = recognition;
+            recognition.continuous = true;
+            recognition.interimResults = true;
+            recognition.lang = navigator.language || "en-US";
+            recognition.onstart = () => {
+                if (sameBox(recording) && !recording.finishing) status("recording");
+            };
+            recognition.onresult = (event) => {
+                if (!sameBox(recording) || recording.abort.signal.aborted) return;
+                // Web Speech results are cumulative; replace interim phrases rather
+                // than appending them again when they become final.
+                for (let index = event.resultIndex; index < event.results.length; index++) {
+                    recording.phrases[index] = event.results[index][0]?.transcript || "";
+                }
+                recording.phrases.length = event.results.length;
+                renderTranscript(recording, recording.phrases.join(" "));
+            };
+            recognition.onerror = (event) => {
+                if (!sameBox(recording) || recording.abort.signal.aborted) return;
+                recording.browserError = new Error(
+                    `Browser speech: ${event.error || "recognition failed"}.`,
+                );
+                completion.resolve();
+                void finish();
+            };
+            recognition.onend = () => {
+                if (!sameBox(recording) || recording.abort.signal.aborted) return;
+                recording.browserEnded = true;
+                completion.resolve();
+                void finish();
+            };
+            recognition.start();
+            drawWaveform(recording);
+            recording.timer = setTimeout(() => finishAtLimit(recording), MAX_RECORDING_MS);
+        } catch (failure) {
+            if (sameBox(recording)) {
+                pocket.notify("error", failure.message);
+                cancel();
+            }
+        }
+    }
+
     async function start() {
         const box = document.querySelector('[data-part~="composer"] textarea');
         const conversationId = pocket.conversationId();
@@ -475,7 +625,10 @@ export default function setup(pocket) {
             return;
         }
 
-        if (!navigator.mediaDevices?.getUserMedia || !window.AudioContext) {
+        if (
+            provider === "codex" &&
+            (!navigator.mediaDevices?.getUserMedia || !window.AudioContext)
+        ) {
             pocket.notify(
                 "error",
                 "Microphone recording requires HTTPS (or localhost) and a supported browser.",
@@ -488,6 +641,7 @@ export default function setup(pocket) {
 
         void connection.promise.catch(() => {});
         const recording = {
+            provider,
             connection: connection.promise,
             rejectConnection: connection.reject,
             abort: new AbortController(),
@@ -508,10 +662,14 @@ export default function setup(pocket) {
         };
 
         current = recording;
-        limitNotice.textContent = "";
-        limitNotice.hidden = true;
+        showProviderNotice();
         status("connecting");
         placeMic();
+
+        if (recording.provider === "browser") {
+            startBrowser(recording);
+            return;
+        }
 
         try {
             // Create and resume during the tap, which iOS requires.
@@ -524,6 +682,16 @@ export default function setup(pocket) {
             if (!sameBox(recording) || recording.abort.signal.aborted) {
                 release(recording);
 
+                return;
+            }
+
+            // iOS can suspend the context while microphone permission is open.
+            if (recording.context.state !== "running") {
+                await recording.context.resume();
+            }
+
+            if (!sameBox(recording) || recording.abort.signal.aborted) {
+                release(recording);
                 return;
             }
 
@@ -630,6 +798,7 @@ export default function setup(pocket) {
 
         if (!send || !composer.querySelector("textarea")) {
             mic.remove();
+            providerSelect.remove();
             limitNotice.remove();
 
             return;
@@ -650,8 +819,11 @@ export default function setup(pocket) {
             send.before(mic);
         }
 
-        if (limitNotice.nextElementSibling !== mic) {
-            mic.before(limitNotice);
+        if (providerSelect.nextElementSibling !== mic) {
+            mic.before(providerSelect);
+        }
+        if (limitNotice.nextElementSibling !== providerSelect) {
+            providerSelect.before(limitNotice);
         }
 
         positionWaveform();
@@ -660,7 +832,7 @@ export default function setup(pocket) {
     const stopUpdates = pocket.on("dictation", (data) => {
         const recording = current;
 
-        if (!recording || data.id !== recording.id) {
+        if (!recording || recording.provider !== "codex" || data.id !== recording.id) {
             return;
         }
 
@@ -712,6 +884,7 @@ export default function setup(pocket) {
     };
 
     status("idle");
+    showProviderNotice();
     observer.observe(document.body, {
         childList: true,
         subtree: true,
@@ -729,6 +902,7 @@ export default function setup(pocket) {
         document.removeEventListener("visibilitychange", onHidden);
         cancel();
         mic.remove();
+        providerSelect.remove();
         limitNotice.remove();
         waveform.remove();
 
